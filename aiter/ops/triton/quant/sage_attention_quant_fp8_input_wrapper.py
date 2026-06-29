@@ -95,11 +95,12 @@ def sage_quant_mxfp4_fp8_input(
     Q_NUM_BLKS = (s_q + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (s_k + BLKK - 1) // BLKK
 
-    # Allocate outputs
+    # Match sage_quant_mxfp4: kernels write d//32 E8M0 groups, not d//BLOCK_R.
+    scale_groups = d // 32
     Q_q = q.new_empty((*q.shape[:-1], d // 2), dtype=torch.uint8)
-    Q_descale = q.new_empty((*q.shape[:-1], d // BLOCK_R), dtype=torch.uint8)
+    Q_descale = q.new_empty((*q.shape[:-1], scale_groups), dtype=torch.uint8)
     K_q = k.new_empty((*k.shape[:-1], d // 2), dtype=torch.uint8)
-    K_descale = k.new_empty((*k.shape[:-1], d // BLOCK_R), dtype=torch.uint8)
+    K_descale = k.new_empty((*k.shape[:-1], scale_groups), dtype=torch.uint8)
 
     stride_qqb, stride_qqm, stride_qqh, stride_qqd = map_dims(Q_q.stride(), bshd_map)
     stride_kqb, stride_kqn, stride_kqh, stride_kqd = map_dims(K_q.stride(), bshd_map)
