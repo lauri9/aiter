@@ -129,6 +129,9 @@ def _rotate_quantize_qk_fp8_kernel(
     K_descale,       # uint8 output (e8m0 scales)
     K_mean,          # fp32 [B, H, D] — per-(B,H,D) mean to subtract on-chip
     R,               # Hadamard matrix [BLOCK_R, BLOCK_R] in bf16
+    Q_input_scale,   # fp32 scalar: x_bf16 = x_fp8 * scale (per-tensor comms)
+    K_input_scale,   # fp32 scalar
+    apply_input_scale: tl.constexpr,
     sm_scale: tl.constexpr,
     stride_qb, stride_qh, stride_qm, stride_qd,
     stride_qqb, stride_qqm, stride_qqh, stride_qqd,
@@ -185,6 +188,11 @@ def _rotate_quantize_qk_fp8_kernel(
         mask=(offs_m[:, None] < seqlen) & (offs_d[None, :] < d_model),
         other=0.0,
     ).to(tl.float32)
+    if apply_input_scale:
+        if is_q_pid:
+            qk_tile *= tl.load(Q_input_scale)
+        else:
+            qk_tile *= tl.load(K_input_scale)
 
     # K-smoothing: subtract per-(B,H,D) mean on-chip for K pids
     if not is_q_pid:

@@ -6,6 +6,9 @@
 # inside the Triton kernels on the first tl.load, so no intermediate bf16
 # tensor is written to HBM.
 #
+# Optional q_input_scale / k_input_scale apply per-tensor comms descale on-chip
+# (x_bf16 = x_fp8 * scale) before Hadamard rotation and mxfp4 quantization.
+#
 # If v is fp8, v_scale must be provided (computed when v was quantized upstream)
 # and sage_quant_v_kernel is skipped entirely — v passes through unchanged.
 # If v is bf16/fp16, v_scale must be None and the existing quantization path runs.
@@ -41,19 +44,20 @@ def sage_quant_mxfp4_fp8_input(
     layout="bshd",
     R=None,
     BLOCK_R=128,
+    q_input_scale=None,
+    k_input_scale=None,
     v_scale=None,
 ):
     """
     Quantize fp8 q/k and bf16-or-fp8 v for mxfp4 sage attention.
 
     q, k must be fp8 (float8_e4m3fn or float8_e4m3fnuz).
+    q_input_scale, k_input_scale: optional fp32 scalars for per-tensor comms
+      descale (``x_bf16 = x_fp8 * scale``). Omit for direct fp8 casts.
     v can be:
       - bf16 or fp16: quantized to fp8 internally; v_scale must be None.
-      - fp8: passed through unchanged; v_scale must be provided. It must
-        be the scale that was used when V was originally quantized, i.e.
-        v_bf16.abs().amax(dim=seq) / FP8_MAX, shape [B, H, D] fp32.
-        Passing the wrong scale produces systematically wrong output
-        magnitudes that propagate directly into the attention result.
+      - fp8: passed through unchanged; v_scale must be provided. Scalar
+        per-tensor comms scale or [B, H, D] from sage_quant_mxfp4-style quant.
 
     Returns: q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
       - q_fp4, k_fp4 : uint8 packed e2m1 fp4
@@ -84,10 +88,24 @@ def sage_quant_mxfp4_fp8_input(
             BLOCK_R ** 0.5
         )
 
-    # Compute k_mean in fp32 on the host (one read-only pass over K), then pass
-    # the small [B, H, D] mean tensor into the kernel so the subtraction happens
-    # on-chip after loading fp8 K. This avoids writing a smoothed-K tensor to HBM.
-    k_mean = k.to(torch.float32).mean(dim=1 if layout == "bshd" else 2)  # [B, H, D]
+    apply_input_scale = q_input_scale is not None or k_input_scale is not None
+    if apply_input_scale:
+        if q_input_scale is None or k_input_scale is None:
+            raise ValueError(
+                "q_input_scale and k_input_scale must both be set for per-tensor fp8 comms descale."
+            )
+        q_input_scale_t = q_input_scale.reshape(()).to(device=q.device, dtype=torch.float32)
+        k_input_scale_t = k_input_scale.reshape(()).to(device=q.device, dtype=torch.float32)
+    else:
+        q_input_scale_t = torch.ones((), device=q.device, dtype=torch.float32)
+        k_input_scale_t = torch.ones((), device=q.device, dtype=torch.float32)
+
+    # K mean for smoothing: use dequantized magnitudes when comms scales apply.
+    if apply_input_scale:
+        k_for_mean = k.to(torch.float32) * k_input_scale_t
+    else:
+        k_for_mean = k.to(torch.float32)
+    k_mean = k_for_mean.mean(dim=1 if layout == "bshd" else 2)  # [B, H, D]
 
     stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd_map)
     stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd_map)
@@ -121,6 +139,9 @@ def sage_quant_mxfp4_fp8_input(
         K_descale,
         k_mean,
         R,
+        q_input_scale_t,
+        k_input_scale_t,
+        apply_input_scale,
         sm_scale * 1.4426950408889634,
         stride_qb, stride_qh, stride_qm, stride_qd,
         stride_qqb, stride_qqm, stride_qqh, stride_qqd,
@@ -140,6 +161,8 @@ def sage_quant_mxfp4_fp8_input(
     if v_is_fp8:
         # v is already quantized upstream — pass through, skip kernel launch.
         v_fp8 = v
+        if v_scale.ndim == 0 or v_scale.numel() == 1:
+            v_scale = v_scale.reshape(()).expand(b, h_k, d).contiguous()
     else:
         # Quantize bf16/fp16 v to fp8.
         # sage_quant_v_kernel expects strides in (B, H, S, D) order regardless of
